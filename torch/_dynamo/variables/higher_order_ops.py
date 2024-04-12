@@ -1529,7 +1529,12 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         proxy_args = (body_node,) + lifted_args
 
-        return proxy_args, {}
+        body_fx_graph_module = torch.fx.GraphModule(tx.output.nn_modules, body_graph)
+
+        # We need the full set of arguments as well we need the lfited score-mod function
+        # in order to compute the correct example output
+
+        return proxy_args, body_fx_graph_module
 
     def call_function(
         self, tx, args: "List[VariableTracker]", kwargs: "Dict[str, VariableTracker]"
@@ -1538,7 +1543,7 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         query, key, value, score_mod = self.normalize_to_args(args, kwargs)
 
-        p_args, p_kwargs = self.create_wrapped_node(tx, query, score_mod)
+        p_args, body_graph = self.create_wrapped_node(tx, query, score_mod)
         proxied_args = [query, key, value]
 
         # Store the invocation as a call
@@ -1546,21 +1551,28 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
         # Proxying user defined functions is not supported.
         inp_args, _ = proxy_args_kwargs(proxied_args, {})
 
-        # Why is this here? Unlike other HOPs, the subgrpah's output for this hop is unrelated
+        # Note:[TemplatedAttention out example value]
+        # Why is this here? Unlike other HOPs, the subgraph's output for this hop is unrelated
         # to what the overall HOP returns, we create the correct output proxy by calling the
-        # hop (self.value) with the example values.
+        # hop (self.value) with the example args, lifted score mod func, and lifted args.
         with torch._guards.TracingContext.try_get().fake_mode:
             example_args = pytree.tree_map_only(
                 torch.fx.Proxy, lambda a: a.node.meta["example_value"], inp_args
             )
-            example_value = self.value(*example_args, score_mod)
+            if len(p_args) > 1:
+                example_buffers = pytree.tree_map_only(
+                    torch.fx.Proxy, lambda a: a.node.meta["example_value"], p_args[1:]
+                )
+            else:
+                example_buffers = ()
+            example_value = self.value(*example_args, body_graph, *example_buffers)
         return wrap_fx_proxy(
             tx=tx,
             proxy=tx.output.create_proxy(
                 "call_function",
                 self.value,
                 args=inp_args + p_args,
-                kwargs=p_kwargs,
+                kwargs={},
             ),
             example_value=example_value,
         )

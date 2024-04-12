@@ -65,8 +65,8 @@ test_score_mods = [
 ]
 
 
-def _causal_mod(score, b, h, token_q, token_kv):
-    return torch.where(token_q >= token_kv, score, float("-inf"))
+def _times_two(score, b, h, m, n):
+    return score * 2
 
 
 B = 4
@@ -220,7 +220,7 @@ class TestTemplatedSDPA(InductorTestCase):
 
             return njt_score_mod
 
-        causal_njt = create_njt_wrapper(_causal_mod, offsets, seq_idx)
+        causal_njt = create_njt_wrapper(_causal, offsets, seq_idx)
 
         self.run_test(causal_njt, dtype)
 
@@ -234,10 +234,11 @@ class TestTemplatedSDPA(InductorTestCase):
             requires_grad=True,
         )
         q, k, v = make_tensor(), make_tensor(), make_tensor()
-        out = _templated_attention(q, k, v, _identity)
+        func = torch.compile(_templated_attention, backend="inductor", fullgraph=True)
         with self.assertRaisesRegex(
-            RuntimeError, "Autograd not implemented for templated_attention"
+            AssertionError, "templated_attention_backward is not an OpOverload"
         ):
+            out = func(q, k, v, _identity)
             out.backward(torch.ones_like(out))
 
     @supported_platform
@@ -311,7 +312,7 @@ class TestTemplatedSDPA(InductorTestCase):
         # x_ref      = ∑_i e^(scores[i])
         # x_compiled = ∑_i 2^(log2(e) * scores[i])
 
-        self.assertTrue(ref_lse.dtype == torch.float32)
+        self.assertTrue(ref_lse.dtype == torch.float64)
         self.assertTrue(compiled_lse.dtype == torch.float32)
         ref_lse = ref_lse * torch.log2(torch.tensor(torch.e))
 
@@ -370,6 +371,22 @@ class TestTemplatedSDPA(InductorTestCase):
         _, code = run_and_get_code(func, q, k, v, _identity)
         # Ensure that two kernels are generated
         FileCheck().check_count(".run(", 2, True).run(code[0])
+
+    @supported_platform
+    @common_utils.parametrize("score_mod", [_identity, _causal, _times_two])
+    def test_aot_eager_gradcheck(self, score_mod):
+        make_tensor = functools.partial(
+            torch.randn,
+            (2, 2, 8, 4),
+            device="cuda",
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        query, key, value = make_tensor(), make_tensor(), make_tensor()
+
+        func = torch.compile(_templated_attention, backend="aot_eager", fullgraph=True)
+
+        self.assertTrue(torch.autograd.gradcheck(func, (query, key, value, score_mod)))
 
 
 common_utils.instantiate_parametrized_tests(TestTemplatedSDPA)
