@@ -355,7 +355,15 @@ else:
         def __eq__(self, other: object) -> bool:
             if not isinstance(other, DeviceMesh):
                 return False
-            return self._hash == other._hash
+            if id(self) == id(other):
+                return True
+            else:
+                return (
+                    self._flatten_mesh_list == other._flatten_mesh_list
+                    and self.mesh.shape == other.mesh.shape
+                    and self.device_type == other.device_type
+                    and self.mesh_dim_names == other.mesh_dim_names
+                )
 
         def __getitem__(self, mesh_dim_name: str) -> "DeviceMesh":
             """
