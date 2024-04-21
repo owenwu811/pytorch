@@ -1717,6 +1717,8 @@ class CppKernel(Kernel):
         self.local_reduction_init = IndentedBuffer()
         self.local_reduction_stores = IndentedBuffer()
         self.is_reduction = False
+        self.reduction_weights_prefix = IndentedBuffer()
+        self.parallel_reduction_weights_prefix = IndentedBuffer()
         self.reduction_cse = CSE(self.newvar_prefix, self.suffix, name_prefix="tmp_acc")
         self.preloads = IndentedBuffer()
         self.poststores = IndentedBuffer()
@@ -1767,6 +1769,26 @@ class CppKernel(Kernel):
                 "}",
             ],
         )
+        if (
+            reduction_type in ["welford_reduce", "welford_combine"]
+            and hasattr(self, "weight_vec_range")
+            and "vec" in f"{acc_type}"
+        ):
+            vec_range_thread = (self.weight_vec_range + num_threads - 1) // num_threads
+            self.parallel_reduction_weights_prefix.writelines(
+                [
+                    f"static std::unique_ptr<{self._get_vec_type(dtype)}[]> weight_vecs(new {self._get_vec_type(dtype)}[{vec_range_thread}]);",
+                    f"static bool weights_buffer_init = false;",
+                    f"if (!weights_buffer_init)",
+                    "{",
+                    f"    weights_buffer_init = true;",
+                    f"    for (const auto i : c10::irange({vec_range_thread}))",
+                    "    {",
+                    f"        weight_vecs[i] = {self._get_vec_type(dtype)}({DTYPE_TO_CPP[dtype]}(1) / static_cast<{DTYPE_TO_CPP[dtype]}>(i + 1));",
+                    "    }",
+                    "};",
+                ],
+            )
 
     def get_reduction_var_pattern(self, line: str):
         return re.search("tmp_acc[0-9]+", line)
@@ -2085,6 +2107,10 @@ class CppKernel(Kernel):
                             prefix = kernel.reduction_prefix
                             if loop.parallel:
                                 prefix = prefix + kernel.parallel_reduction_prefix
+                                prefix = prefix + kernel.parallel_reduction_weights_prefix
+                                # remove outer weights buffer prefix for welford reduce
+                                kernel.reduction_weights_prefix.clear()
+                            prefix = prefix + kernel.reduction_weights_prefix
                             return prefix
 
             def gen_loops(loops: List[LoopLevel], in_reduction=False):
@@ -2521,9 +2547,41 @@ class CppVecKernel(CppKernel):
         self.reduction_prefix.writeline(
             f"{acc_type_vec} {acc_vec} = {self.reduction_init_vec(reduction_type, dtype)};"
         )
-        self.stores.writeline(
-            f"{acc_vec} = {self.reduction_combine_vec(reduction_type, acc_vec, value)};"
+        # save the reciprocal of weights for welford reduce if using static shape
+        weight_num_range = functools.reduce(
+            lambda x, y: x * y, self.ranges[self.reduction_depth :]
         )
+        if (
+            reduction_type in ["welford_reduce", "welford_combine"]
+            and weight_num_range.is_number
+        ):
+            weights_factor = self.tiling_factor if self.tiling_idx >= self.reduction_depth else 1
+            weight_num_range = weight_num_range - weight_num_range % weights_factor
+            self.weight_vec_range = (
+                weight_num_range + weights_factor - 1
+            ) // weights_factor
+            self.reduction_weights_prefix.writelines(
+                [
+                    f"static std::unique_ptr<{self._get_vec_type(dtype)}[]> weight_vecs(new {self._get_vec_type(dtype)}[{self.weight_vec_range}]);",
+                    f"static bool weights_buffer_init = false;",
+                    f"if (!weights_buffer_init)",
+                    "{",
+                    f"    weights_buffer_init = true;",
+                    f"    for (const auto i : c10::irange({self.weight_vec_range}))",
+                    "    {",
+                    f"        weight_vecs[i] = {self._get_vec_type(dtype)}({DTYPE_TO_CPP[dtype]}(1) / static_cast<{DTYPE_TO_CPP[dtype]}>(i + 1));",
+                    "    }",
+                    "};",
+                ],
+            )
+            reduction_combine_vec_str = self.reduction_combine_vec(reduction_type, acc_vec, value, True)
+            self.stores.writeline(
+                f"{acc_vec} = {reduction_combine_vec_str};"
+            )
+        else:
+            self.stores.writeline(
+                f"{acc_vec} = {self.reduction_combine_vec(reduction_type, acc_vec, value)};"
+            )
         self._gen_parallel_reduction_buffers(
             acc,
             acc_type,
@@ -2644,7 +2702,7 @@ class CppVecKernel(CppKernel):
 
         return vec_type
 
-    def reduction_combine_vec(self, reduction_type, var, next_value):
+    def reduction_combine_vec(self, reduction_type, var, next_value, use_weights=False):
         if reduction_type == "max":
             return f"at::vec::maximum({var}, {next_value})"
         elif reduction_type == "min":
@@ -2656,7 +2714,10 @@ class CppVecKernel(CppKernel):
         elif reduction_type == "xor_sum":
             return f"{var} ^ {next_value}"
         elif reduction_type == "welford_reduce":
-            return f"welford_combine({var}, {next_value})"
+            if use_weights:
+                return f"welford_combine({var}, {next_value}, weight_vecs)"
+            else:
+                return f"welford_combine({var}, {next_value})"
         elif reduction_type == "welford_combine":
             if isinstance(next_value, tuple):
                 # When reading a value from Inductor IR we have a tuple of variable names
