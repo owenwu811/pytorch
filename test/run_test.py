@@ -26,6 +26,7 @@ from torch.multiprocessing import current_process, get_context
 from torch.testing._internal.common_utils import (
     FILE_SCHEMA,
     get_report_path,
+    IS_ARM64_LINUX,
     IS_CI,
     IS_MACOS,
     parser as common_parser,
@@ -265,6 +266,10 @@ CORE_TEST_LIST = [
     "test_torch",
 ]
 
+# A subset of the TEST list for aarch64 linux platform
+ARM64_LINUX_TEST_LIST = [
+    "test_modules",
+]
 
 # if a test file takes longer than 5 min, we add it to TARGET_DET_LIST
 SLOW_TEST_THRESHOLD = 300
@@ -1293,6 +1298,10 @@ def can_run_in_pytest(test):
 
 
 def get_selected_tests(options) -> List[str]:
+    if IS_ARM64_LINUX:
+        selected_tests = ARM64_LINUX_TEST_LIST
+        return selected_tests
+
     selected_tests = options.include
 
     # filter if there's JIT only and distributed only test options
