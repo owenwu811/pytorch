@@ -388,6 +388,27 @@ class TestTemplatedSDPA(InductorTestCase):
 
         self.assertTrue(torch.autograd.gradcheck(func, (query, key, value, score_mod)))
 
+    @supported_platform
+    def test_captured_score_mod_aot_eager_gradcheck(self):
+        make_tensor = functools.partial(
+            torch.randn,
+            (2, 2, 8, 4),
+            device="cuda",
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        query, key, value = make_tensor(), make_tensor(), make_tensor()
+
+        func = torch.compile(_templated_attention, backend="aot_eager", fullgraph=True)
+
+        head_offset = torch.rand(H, device="cuda", dtype=torch.float64)
+
+        # Uses a lifted variable and creates correct joint graph is required for gradcheck
+        def score_mod(score, b, h, m, n):
+            return score * index(head_offset, [h])
+
+        self.assertTrue(torch.autograd.gradcheck(func, (query, key, value, score_mod)))
+
 
 common_utils.instantiate_parametrized_tests(TestTemplatedSDPA)
 

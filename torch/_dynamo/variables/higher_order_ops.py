@@ -1529,12 +1529,7 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         proxy_args = (body_node,) + lifted_args
 
-        body_fx_graph_module = torch.fx.GraphModule(tx.output.nn_modules, body_graph)
-
-        # We need the full set of arguments as well we need the lfited score-mod function
-        # in order to compute the correct example output
-
-        return proxy_args, body_fx_graph_module
+        return proxy_args
 
     def call_function(
         self, tx, args: "List[VariableTracker]", kwargs: "Dict[str, VariableTracker]"
@@ -1543,7 +1538,7 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
 
         query, key, value, score_mod = self.normalize_to_args(args, kwargs)
 
-        p_args, body_graph = self.create_wrapped_node(tx, query, score_mod)
+        p_args = self.create_wrapped_node(tx, query, score_mod)
         proxied_args = [query, key, value]
 
         # Store the invocation as a call
@@ -1551,21 +1546,15 @@ class TemplatedAttentionHigherOrderVariable(TorchHigherOrderOperatorVariable):
         # Proxying user defined functions is not supported.
         inp_args, _ = proxy_args_kwargs(proxied_args, {})
 
-        # Note:[TemplatedAttention out example value]
-        # Why is this here? Unlike other HOPs, the subgraph's output for this hop is unrelated
-        # to what the overall HOP returns, we create the correct output proxy by calling the
-        # hop (self.value) with the example args, lifted score mod func, and lifted args.
+        query_meta = query.as_proxy().node.meta["example_value"]
+        logsumexp_shape = query_meta.size()[:-1]  # [B, H, M]
         with torch._guards.TracingContext.try_get().fake_mode:
-            example_args = pytree.tree_map_only(
-                torch.fx.Proxy, lambda a: a.node.meta["example_value"], inp_args
+            out_meta = torch.empty_like(
+                query_meta, memory_format=torch.contiguous_format
             )
-            if len(p_args) > 1:
-                example_buffers = pytree.tree_map_only(
-                    torch.fx.Proxy, lambda a: a.node.meta["example_value"], p_args[1:]
-                )
-            else:
-                example_buffers = ()
-            example_value = self.value(*example_args, body_graph, *example_buffers)
+            lse_meta = query_meta.new_empty(logsumexp_shape, dtype=torch.float32)
+        example_value = (out_meta, lse_meta)
+
         return wrap_fx_proxy(
             tx=tx,
             proxy=tx.output.create_proxy(
