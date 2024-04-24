@@ -308,7 +308,35 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
         (torch.nn.Conv3d, F.batch_norm),
     ]
     modules = dict(gm.named_modules())
+
+    class ConvBNFusion:
+        def __init__(
+            self,
+            bn_node,
+            conv_module,
+            bn_module=None,
+            bn_running_mean=None,
+            bn_running_var=None,
+            bn_eps=None,
+            bn_weight=None,
+            bn_bias=None,
+        ):
+            self.bn_nodes = [
+                bn_node,
+            ]
+            self.conv_module = conv_module
+            self.bn_module = bn_module
+            self.bn_running_mean = bn_running_mean
+            self.bn_running_var = bn_running_var
+            self.bn_eps = bn_eps
+            self.bn_weight = bn_weight
+            self.bn_bias = bn_bias
+
+        def add_bn_node(self, bn_node):
+            self.bn_nodes.append(bn_node)
+
     for pattern in modules_patterns:
+        conv_bn_to_fuse = {}
         for node in gm.graph.nodes:
             if matches_module_pattern(pattern, node, modules):
                 if len(node.args[0].users) > 1:  # Output of conv is used by other nodes
@@ -320,12 +348,34 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                     continue
                 if not bn.track_running_stats:
                     continue
-                fused_conv = fuse_conv_bn_eval(conv, bn)
-                replace_node_module(node.args[0], modules, fused_conv)
-                node.replace_all_uses_with(node.args[0])
-                gm.graph.erase_node(node)
+
+                # Do hash based on the module name of conv
+                hash_id = hash(node.args[0].target)
+                if hash_id not in conv_bn_to_fuse:
+                    conv_bn_to_fuse[hash_id] = ConvBNFusion(node, conv, bn)
+                else:
+                    # <TODO> Leslie: if any Conv module used by multi Conv-BN patterns,
+                    # We assume this conv module following by same BN Module in current implementation.
+                    # If not, we should extend implementation to disable the Conv-BN fusion for this case.
+                    assert bn == conv_bn_to_fuse[hash_id].bn_module
+                    conv_bn_to_fuse[hash_id].add_bn_node(node)
+
+        for conv_bn_fusion in conv_bn_to_fuse.values():
+            # Multi Conv-BN nodes share same Conv-BN Module
+            # We should only fold once for each Conv-BN Module
+            bn_nodes = conv_bn_fusion.bn_nodes
+            conv = conv_bn_fusion.conv_module
+            bn = conv_bn_fusion.bn_module
+
+            fused_conv = fuse_conv_bn_eval(conv, bn)
+            for bn_node in bn_nodes:
+                replace_node_module(bn_node.args[0], modules, fused_conv)
+                bn_node.replace_all_uses_with(bn_node.args[0])
+                gm.graph.erase_node(bn_node)
+
     gm.graph.lint()
     for pattern in module_function_patterns:
+        conv_bn_to_fuse = {}
         for node in gm.graph.nodes:
             if matches_module_function_pattern(pattern, node, modules):
                 # TODO: support kwargs.
@@ -338,8 +388,17 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                     continue
                 if type(bn_eps) is not float:
                     continue
+
+                def _used_by_same_conv_module(users):
+                    conv_module_name = users[0].args[0].target
+                    return all(
+                        conv_module_name == user.args[0].target for user in users
+                    )
+
                 bn_args_is_constant = all(
-                    n.op == "get_attr" and len(n.users) == 1 for n in node.args[1:5]
+                    n.op == "get_attr"
+                    and (len(n.users) == 1 or _used_by_same_conv_module(list(n.users)))
+                    for n in node.args[1:5]
                 )
                 if not bn_args_is_constant:
                     continue
@@ -349,19 +408,57 @@ def fuse_conv_bn(gm: torch.fx.GraphModule, inplace=False) -> torch.fx.GraphModul
                 bn_bias = fetch_attr(node.args[4].target, gm)
                 if bn_running_mean is None or bn_running_var is None:
                     continue
-                fused_conv = copy.deepcopy(conv)
-                fused_conv.weight, fused_conv.bias = fuse_conv_bn_weights(
-                    fused_conv.weight,
-                    fused_conv.bias,
-                    bn_running_mean,
-                    bn_running_var,
-                    bn_eps,
-                    bn_weight,
-                    bn_bias,
-                )
-                replace_node_module(node.args[0], modules, fused_conv)
-                node.replace_all_uses_with(node.args[0])
-                gm.graph.erase_node(node)
+
+                # Do hash based on the module name of conv
+                hash_id = hash(node.args[0].target)
+                if hash_id not in conv_bn_to_fuse:
+                    conv_bn_to_fuse[hash_id] = ConvBNFusion(
+                        node,
+                        conv,
+                        bn_running_mean=bn_running_mean,
+                        bn_running_var=bn_running_var,
+                        bn_eps=bn_eps,
+                        bn_weight=bn_weight,
+                        bn_bias=bn_bias,
+                    )
+                else:
+                    # <TODO> Leslie: if any Conv module used by multi Conv-BN patterns,
+                    # We assume this conv module following by same BN Module in current implementation.
+                    # If not, we should extend implementation to disable the Conv-BN fusion for this case.
+                    assert (
+                        hash(bn_running_mean)
+                        == hash(conv_bn_to_fuse[hash_id].bn_running_mean)
+                        and hash(bn_running_var)
+                        == hash(conv_bn_to_fuse[hash_id].bn_running_var)
+                        and hash(bn_eps) == hash(conv_bn_to_fuse[hash_id].bn_eps)
+                        and hash(bn_weight) == hash(conv_bn_to_fuse[hash_id].bn_weight)
+                        and hash(bn_bias) == hash(conv_bn_to_fuse[hash_id].bn_bias)
+                    )
+                    conv_bn_to_fuse[hash_id].add_bn_node(node)
+
+        for conv_bn_fusion in conv_bn_to_fuse.values():
+            bn_nodes = conv_bn_fusion.bn_nodes
+            conv = conv_bn_fusion.conv_module
+            bn_running_mean = conv_bn_fusion.bn_running_mean
+            bn_running_var = conv_bn_fusion.bn_running_var
+            bn_eps = conv_bn_fusion.bn_eps
+            bn_weight = conv_bn_fusion.bn_weight
+            bn_bias = conv_bn_fusion.bn_bias
+
+            fused_conv = copy.deepcopy(conv)
+            fused_conv.weight, fused_conv.bias = fuse_conv_bn_weights(
+                fused_conv.weight,
+                fused_conv.bias,
+                bn_running_mean,
+                bn_running_var,
+                bn_eps,
+                bn_weight,
+                bn_bias,
+            )
+            for bn_node in bn_nodes:
+                replace_node_module(bn_node.args[0], modules, fused_conv)
+                bn_node.replace_all_uses_with(bn_node.args[0])
+                gm.graph.erase_node(bn_node)
     gm.graph.lint()
     gm.recompile()
 

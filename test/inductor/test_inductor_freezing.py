@@ -90,6 +90,41 @@ class ConvBN(torch.nn.Module):
         return self.bn(self.conv(x))
 
 
+class ConvFunctionBN(torch.nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        bias=False,
+        kernel_size=3,
+        stride=2,
+        running_mean=None,
+        running_var=None,
+        weight=None,
+        bn_bias=None,
+    ):
+        super().__init__()
+        self.conv = torch.nn.Conv2d(
+            in_channels, out_channels, bias=bias, kernel_size=kernel_size, stride=stride
+        )
+        self.running_mean = running_mean
+        self.running_var = running_var
+        self.weight = weight
+        self.bias = bn_bias
+
+    def forward(self, x):
+        return torch.nn.functional.batch_norm(
+            self.conv(x),
+            self.running_mean,
+            self.running_var,
+            self.weight,
+            self.bias,
+            False,
+            0.1,
+            1e-5,
+        )
+
+
 class OptimizeForInferenceTemplate(TestCase):
     def test_mutation(self):
         class Mod(torch.nn.Module):
@@ -374,6 +409,76 @@ class OptimizeForInferenceTemplate(TestCase):
             self.assertEqual(
                 out_optimized_for_infernece, out_eager, atol=1e-2, rtol=1e-2
             )
+
+    @torch._inductor.config.patch(layout_optimization=False)
+    def test_folded_conv_bn_with_dead_nodes(self):
+        mod = (
+            ConvBN(32, 32, bias=True, kernel_size=3, stride=2)
+            .to(self.device)
+            .to(torch.float32)
+        )
+
+        # Change the parameter of BN module from default
+        for _ in range(10):
+            mod(torch.rand(3, 32, 32, 32).to(self.device).to(torch.float32))
+
+        mod.eval()
+        x = torch.rand(3, 32, 32, 32).to(self.device).to(torch.float32)
+
+        @torch.compile()
+        def foo(mod, x):
+            mod(x)
+            return mod(x)
+
+        with torch.no_grad():
+            out_eager = mod(x)
+            out_optimized_for_infernece, code = run_and_get_code(foo, mod, x)
+
+        self.assertNotIn(
+            "aten._native_batch_norm_legit_no_training(",
+            code[0],
+        )
+
+        self.assertEqual(out_optimized_for_infernece, out_eager, atol=1e-2, rtol=1e-2)
+
+    @torch._inductor.config.patch(layout_optimization=False)
+    def test_folded_conv_functional_bn_with_dead_nodes(self):
+        x = torch.rand(3, 32, 32, 32).to(self.device).to(torch.float32)
+        running_mean = torch.mean(x, dim=(0, 2, 3))
+        running_var = torch.var(x, dim=(0, 2, 3))
+
+        mod = (
+            ConvFunctionBN(
+                32,
+                32,
+                bias=True,
+                kernel_size=3,
+                stride=2,
+                running_mean=running_mean,
+                running_var=running_var,
+                weight=torch.ones(32),
+                bn_bias=torch.zeros(32),
+            )
+            .eval()
+            .to(self.device)
+            .to(torch.float32)
+        )
+
+        @torch.compile()
+        def foo(mod, x):
+            mod(x)
+            return mod(x)
+
+        with torch.no_grad():
+            out_eager = mod(x)
+            out_optimized_for_infernece, code = run_and_get_code(foo, mod, x)
+
+        self.assertNotIn(
+            "aten._native_batch_norm_legit_no_training(",
+            code[0],
+        )
+
+        self.assertEqual(out_optimized_for_infernece, out_eager, atol=1e-2, rtol=1e-2)
 
     @torch._inductor.config.patch(layout_optimization=False)
     def test_dont_change_dtype_folding(self):
