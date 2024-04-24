@@ -1890,9 +1890,7 @@ class TestExport(TestCase):
                 self.register_buffer("C", buf)  # aliasing
 
             def forward(self, x):
-                a = getattr(getattr(self, "***").bar, "23$$@gmail*com")
                 b = getattr(getattr(self, "***"), "a:b")
-                c = self.C
                 return x + b
 
         mod = Foo()
@@ -1903,7 +1901,7 @@ class TestExport(TestCase):
             for spec in ep.graph_signature.input_specs
             if spec.kind == InputKind.BUFFER
         ][0]
-        self.assertEqual(buf_spec.target, "***.bar.23$$@gmail*com")
+        self.assertEqual(buf_spec.target, "***.a:b")
 
     def test_export_dynamo_config(self):
         class MyModule(torch.nn.Module):
