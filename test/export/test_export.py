@@ -1868,6 +1868,43 @@ class TestExport(TestCase):
         self.assertEqual(buffer[1].shape, torch.Size([100]))  # running_var
         self.assertEqual(buffer[2].shape, torch.Size([]))  # num_batches_tracked
 
+    def test_fqn_matching(self):
+        from torch.export.graph_signature import InputKind
+
+        class Bar(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("23$$@gmail*com", torch.randn(4))
+
+        class Basic(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bar = Bar()
+
+        class Foo(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_module("***", Basic())
+                buf = getattr(getattr(self, "***").bar, "23$$@gmail*com")
+                getattr(self, "***").register_buffer("a:b", buf)  # aliasing
+                self.register_buffer("C", buf)  # aliasing
+
+            def forward(self, x):
+                a = getattr(getattr(self, "***").bar, "23$$@gmail*com")
+                b = getattr(getattr(self, "***"), "a:b")
+                c = self.C
+                return x + b
+
+        mod = Foo()
+        ep = export(mod, (torch.randn(4, 4),))
+        # assert that correct FQN is assigned
+        buf_spec = [
+            spec
+            for spec in ep.graph_signature.input_specs
+            if spec.kind == InputKind.BUFFER
+        ][0]
+        self.assertEqual(buf_spec.target, "***.bar.23$$@gmail*com")
+
     def test_export_dynamo_config(self):
         class MyModule(torch.nn.Module):
             def __init__(self):

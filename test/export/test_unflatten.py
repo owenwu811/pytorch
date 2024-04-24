@@ -671,6 +671,21 @@ class TestUnflatten(TestCase):
             fqn_list,
         )
 
+    def test_simple_alias(self):
+        class Foo(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.bias = torch.nn.Parameter(torch.randn(4))
+                self.m = torch.nn.Linear(4, 4)
+                self.m.bias = self.bias  # self.bias is unused, aliasing should be handled
+            def forward(self, x):
+                return self.m(x)
+
+        m = Foo()
+        inps = (torch.randn(4, 4),)
+        ep = export(m, inps)
+        unep = unflatten(ep)
+        self.assertTrue(torch.allclose(unep(*inps), m(*inps)))
 
 if __name__ == "__main__":
     run_tests()
