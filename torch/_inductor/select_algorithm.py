@@ -3,6 +3,7 @@ import functools
 import inspect
 import itertools
 import logging
+import math
 import operator
 import sys
 import textwrap
@@ -10,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from io import StringIO
 
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, Union
 from unittest.mock import patch
 
 import sympy
@@ -511,7 +512,7 @@ class TritonTemplate(KernelTemplate):
         self.all_templates[name] = self
         self.debug = debug
 
-    def generate(
+    def generate(  # type: ignore[override]
         self,
         input_nodes,
         layout,
@@ -523,8 +524,8 @@ class TritonTemplate(KernelTemplate):
         subgraphs=None,
         mutated_inputs=None,
         **kwargs,
-    ):
-        """This function generates a TritonTemplateCaller
+    )  -> Generator[ChoiceCaller, None, None]:
+        """This function generates TritonTemplateCallers
 
         Args:
             input_nodes: List of input nodes
@@ -582,7 +583,7 @@ class TritonTemplate(KernelTemplate):
                 code = kernel.render(self.template, kwargs).finalize()
             except ZeroDivisionError:
                 # TODO(nmacchioni): fix sympy division by zero
-                return None
+                return None  # noqa: B901
             if self.debug:
                 print("Generated Code:\n", code)
             extra = (
@@ -659,7 +660,7 @@ class TritonTemplate(KernelTemplate):
             output_tensor_meta=TensorMeta.from_irnodes(layout),
         )
 
-        return TritonTemplateCaller(
+        yield TritonTemplateCaller(
             kernel_hash_name,
             full_input_nodes,
             layout,
@@ -925,6 +926,7 @@ class AlgorithmSelectorCache(PersistentCache):
         # arg, the function will be called instead of
         # generating a random torch.Tensor for benchmarking.
         input_gen_fns: Optional[Dict[int, Callable[[ir.Buffer], torch.Tensor]]] = None,
+        return_selection_result_details=False,
         precompilation_timeout_seconds: int = 60 * 60,
         return_multi_template=False,
     ):
@@ -941,7 +943,7 @@ class AlgorithmSelectorCache(PersistentCache):
         choices = [choice for choice in choices if choice is not None]
 
         if len(choices) == 0:
-            raise RuntimeError(
+            raise NoValidChoicesError(
                 "No choices to select, please consider adding ATEN into max_autotune_gemm_backends "
                 "config (defined in torch/_inductor/config.py) to allow at least one choice. "
             )
@@ -949,6 +951,8 @@ class AlgorithmSelectorCache(PersistentCache):
 
         if len(choices) == 1:
             if not isinstance(choices[0], CUDATemplateCaller):
+                if return_selection_result_details:
+                    return choices[0], {choices[0]: -1.0}
                 # CUDATemplateCaller still needs to go through autotuning process to retrieve workspace size.
                 return choices[0].output_node()
 
@@ -1106,7 +1110,18 @@ class AlgorithmSelectorCache(PersistentCache):
         if timings == {} or choices[0] not in timings:
             return choices[0].output_node()
 
-        selected_choice = builtins.min(timings, key=timings.__getitem__).output_node()
+        selected_key = builtins.min(timings, key=timings.__getitem__)
+        selected_time = timings[selected_key]
+        if (
+            (not isinstance(selected_time, float))
+            or (selected_time < 0.0)
+            or (not math.isfinite(selected_time))
+            or math.isnan(selected_time)
+        ):
+            raise NoValidChoicesError()
+        if return_selection_result_details:
+            return selected_key, timings
+        selected_choice = selected_key.output_node()
         log.debug("selected choice: %s", str(selected_choice))
         return selected_choice
 
@@ -1147,14 +1162,17 @@ class AlgorithmSelectorCache(PersistentCache):
                 for input_node in input_nodes
             ]
 
-            out = cls.benchmark_example_value(layout)
-            out_extern = torch.as_strided(
-                out, out.size(), out.stride(), V.graph.sizevars.size_hint(layout.offset)
-            )
-            expected = None
-            if VERIFY:
-                choices[0].benchmark(*example_inputs_extern, out=out_extern)
-                expected = out_extern.clone()
+        out = cls.benchmark_example_value(layout)
+        out_extern = torch.as_strided(
+            out, out.size(), out.stride(), V.graph.sizevars.size_hint(layout.offset)
+        )
+        expected = None
+        if VERIFY:
+            for i in range(len(choices)):
+                if isinstance(choices[i], ExternKernelCaller):
+                    choices[i].benchmark(*example_inputs_extern, out=out_extern)
+                    expected = out_extern.clone()
+                    break
 
             return example_inputs, example_inputs_extern, out, out_extern, expected
 
@@ -1186,7 +1204,7 @@ class AlgorithmSelectorCache(PersistentCache):
             else:
                 # triton templates want the base pointer for sliced tensors
                 result = choice.benchmark(*example_inputs, out=out)
-            if VERIFY:
+            if VERIFY and expected is not None:
                 torch.testing.assert_close(out_extern, expected, **VERIFY)
             torch.cuda.synchronize()  # shake out any CUDA errors
             return result
@@ -1201,22 +1219,23 @@ class AlgorithmSelectorCache(PersistentCache):
                 try:
                     timing = benchmark_choice_in_current_process(choice, *inputs)
                 except CUDACompileError as e:
-                    log.warning(
-                        "CUDA compilation error: \n%s. \nIgnore this choice.", str(e)
+                    log.error(
+                        "CUDA compilation error during autotuning: \n%s. \nIgnoring this choice.",
+                        str(e),
                     )
                     timing = float("inf")
                 except RuntimeError as e:
                     msg = str(e)
                     if "invalid argument" in msg:
                         msg += "\n\nThis may mean this GPU is too small for max_autotune mode.\n\n"
-                        log.warning(msg)
-                        timing = float("inf")
                     else:
                         if "illegal memory access" in msg:
                             msg += "\n\nEither error in template or triton bug.\n"
-                        raise ErrorFromChoice(
-                            msg, choice, debug_str(example_inputs, out)
-                        ) from e
+                    log.error(
+                        "Runtime error during autotuning: \n%s. \nIgnoring this choice.",
+                        msg,
+                    )
+                    timing = float("inf")
                 except OutOfResources as e:
                     log.warning(e)
                     timing = float("inf")
