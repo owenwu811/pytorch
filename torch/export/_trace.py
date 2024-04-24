@@ -244,7 +244,35 @@ def _get_param_buffer_mapping(
         """
         Given a set of FQN names (from .named_parameters() or .named_buffers()),
         finds a match for dynamo-named <dynamo_name>. Raises an error if not found.
+
+        This seems overly complicated, but is necessary to handle weight-sharing and aliasing.
+        Niche cases can arise where parameters are aliased but some aliases are unused.
+        For example:
+
+            class Foo(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.bias = torch.nn.Parameter(torch.randn(4))
+                    self.m = torch.nn.Linear(4, 4)
+                    self.m.bias = self.bias  # self.bias is unused, aliasing should be handled
+                def forward(self, x):
+                    return self.m(x)
+
+        In this scenario m.bias and bias exist as aliases, and both will show up in
+        original_module.named_parameters(remove_duplicate=False).
+        However, dynamo will only trace the one used occurrence (m.bias), and produce a dynamo name
+        (e.g L__self___m_bias), and based on this we need to be able to restore the correct FQN.
+
+        Restoring the correct FQN is important in unflattening: the exported program will only store
+        one instance of the parameter, and unflattening will only use the restored FQN. If this FQN
+        is incorrect, unflattening's _sink_params() routine will fail to sink/unlift the correct
+        parameter attribute into a getattr node, and fail during the unflattened module's forward pass,
+        expecting additional inputs for placeholder nodes.
+
+        One alternative is for exported programs/unflattener to somehow track and restore unused
+        parameters & modules during tracing, but that seems like a large redesign of how things are done.
         """
+
         match = None
         for name in lookup:
             converted_name = _convert_to_dynamo_name(original_module, name)
