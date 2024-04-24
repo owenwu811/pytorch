@@ -23,7 +23,7 @@ import sys
 import threading
 import unittest
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 from unittest.mock import patch
 
 import expecttest
@@ -633,7 +633,7 @@ class TestProfiler(TestCase):
             stats = run_profiler(create_cuda_tensor)
             check_metrics(
                 stats,
-                "cuda_memory_usage",
+                "device_memory_usage",
                 allocs=[
                     "test_user_scope_alloc",
                     "aten::to",
@@ -685,7 +685,7 @@ class TestProfiler(TestCase):
             deallocs=["[memory]"],
         )
         if torch.cuda.is_available():
-            check_metrics(stats, "cuda_memory_usage", deallocs=["[memory]"])
+            check_metrics(stats, "device_memory_usage", deallocs=["[memory]"])
 
     @unittest.skipIf(
         IS_JETSON, "Jetson has a guard against OOM since host and gpu memory are shared"
@@ -1693,6 +1693,7 @@ class MockNode:
     def __init__(self, name, children) -> None:
         self.name = name
         self.children = [MockNode(name, i) for name, i in children.items()]
+
 
 class TestExperimentalUtils(TestCase):
     def make_tree(self) -> List[MockNode]:
