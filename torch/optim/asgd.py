@@ -98,9 +98,9 @@ class ASGD(Optimizer):
                     state["step"] = torch.zeros(
                         (), device=p.device, dtype=_get_scalar_dtype()
                     )
-                    state["eta"] = torch.tensor(
+                    state["eta"] = torch.as_tensor(
                         group["lr"], device=p.device, dtype=_get_scalar_dtype()
-                    )
+                    ).clone().detach()
                     state["mu"] = torch.ones(
                         (), device=p.device, dtype=_get_scalar_dtype()
                     )
